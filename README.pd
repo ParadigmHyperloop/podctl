@@ -1,0 +1,14 @@
+# PodCTL
+
+PodCTL is a command line utility for interacting directly with the 
+Core Controller's Remote Command Server.
+
+# Features
+
+- Automatic reconnection on controller restarts
+- Heartbeat simulation
+- Remote Command Line interface
+
+# License
+
+BSD
