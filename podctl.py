@@ -21,33 +21,82 @@ import argparse
 import sys
 import select
 import threading
+import traceback
+from ansi import Ansi
 from datetime import datetime, timedelta
 
 MAX_MESSAGE_SIZE = 2048
+PING_TIMEOUT = timedelta(seconds=1)
 
 logging.basicConfig(level=logging.WARN)
 
+
+class PodStateType(type):
+    MAP = {
+        'POST': 0,
+        'BOOT': 1,
+        'LPFILL': 2,
+        'HPFILL': 3,
+        'LOAD': 4,
+        'STANDBY': 5,
+        'ARMED': 6,
+        'PUSHING': 7,
+        'COASTING': 8,
+        'BRAKING': 9,
+        'VENT': 10,
+        'RETRIEVAL': 11,
+        'EMERGENCY': 12,
+        'SHUTDOWN': 13
+    }
+
+
+    def __getattr__(cls, name):
+        if name in cls.MAP:
+            return cls.MAP[name]
+        raise AttributeError(name)
+
+class PodState(metaclass=PodStateType):
+    def __init__(self, state):
+        self._state = int(state)
+
+    def is_fault(self):
+        return self._state == PodState.EMERGENCY
+
+    def is_moving(self):
+        return self._state in (PodState.BRAKING, PodState.COASTING, PodState.PUSHING)
+
+    def __str__(self):
+        keys = [key for key, val in PodState.MAP.items() if val == self._state]
+        if not keys:
+            return "UNKNOWN"
+        else:
+            return keys[0]
 
 class Pod:
     def __init__(self, addr):
         self.sock = None
         self.addr = addr
         self.last_ping = datetime.now()
+        self.recieved = 0
+        self.state = None
 
     def ping(self, _):
         self.send("ping")
 
-        timed_out = (datetime.now() - self.last_ping > timedelta(seconds=10))
-        if self.sock is not None and timed_out:
-            print("PING TIMEOUT!")
-            self.sock.close()
-            self.sock = None
+        timed_out = (datetime.now() - self.last_ping > PING_TIMEOUT)
+        if self.is_connected() and timed_out and self.recieved > 0:
+            print(Ansi.make_bold(Ansi.make_red("PING TIMEOUT!")))
+            self.close()
 
     def handle_data(self, data):
         if "PONG" in data:
             self.last_ping = datetime.now()
+            self.recieved += 1
+            self.state = PodState(data.split(":")[1])
         else:
             sys.stdout.write(data)
+
+        return "PONG" not in data
 
     def command(self, cmd):
         self.send(cmd + "\n")
@@ -56,7 +105,7 @@ class Pod:
         logging.info("[DATA] {}".format(data))
 
     def send(self, data):
-        if self.sock is None:
+        if not self.is_connected():
             return
 
         try:
@@ -66,7 +115,7 @@ class Pod:
             self.close()
 
     def recv(self):
-        if self.sock is None:
+        if not self.is_connected():
             return
 
         try:
@@ -78,11 +127,18 @@ class Pod:
     def connect(self):
         while True:
             try:
-                self.sock = socket.create_connection(self.addr)
+                self.sock = socket.create_connection(self.addr, 1)
+
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+
+                self.recieved = 0
+                self.last_ping = datetime.now()
                 break
             except Exception as e:
                 logging.error(e)
                 time.sleep(1)
+                self.close()
 
     def close(self):
         if self.sock is not None:
@@ -90,7 +146,7 @@ class Pod:
             self.sock = None
 
     def is_connected(self):
-        return self.sock is not None
+        return self.sock is not None and self.sock.fileno() >= 0
 
 
 class Heart:
@@ -109,22 +165,43 @@ class Heart:
         self.running = False
 
 
+def user_write(txt):
+    sys.stdout.write(txt)
+    sys.stdout.flush()
+
+def make_prompt(pod):
+    details = "%s:%d" % pod.addr
+    if pod.state is not None:
+        details += " %s" % pod.state
+        if pod.state.is_fault():
+            details = Ansi.make_red(details)
+        else:
+            details = Ansi.make_green(details)
+    else:
+        details = Ansi.make_yellow(details)
+
+    return Ansi.make_bold("Pod(%s)> " % details)
+
 def loop(pod):
     print("CLI Connecting to {}:{}".format(pod.addr[0], pod.addr[1]))
     pod.connect()
 
+    if pod.is_connected():
+        pod.command("help")
+
     while pod.is_connected():
-        (ready, _, _) = select.select([pod.sock, sys.stdin], [], [], 1)
+        (ready, _, _) = select.select([pod.sock, sys.stdin], [], [], 0.1)
 
         if pod.sock in ready:
             data = pod.recv()
-            if data:
-                pod.handle_data(data)
+            if data and pod.handle_data(data):
+                user_write(make_prompt(pod))
 
         if sys.stdin in ready:
             cmd = sys.stdin.readline()
+            if cmd == '':
+                sys.exit(0)
             pod.command(cmd)
-
 
 def main():
     parser = argparse.ArgumentParser(description="Openloop Command Client",
@@ -153,8 +230,21 @@ def main():
     threading.Thread(target=heart.start).start()
 
     while True:
-        loop(pod)
+        try:
+            loop(pod)
+        except SystemExit:
+            heart.stop()
+            raise
+        except KeyboardInterrupt:
+            print("Keyboard Interupt... shutdown")
+            heart.stop()
+            sys.exit(1)
 
+        except IOError as e:
+            print("[IOERROR] %s" % e)
+        except Exception as e:
+            print("[ERROR] %s" % e)
+            traceback.print_exc()
 
 if "__main__" == __name__:
     main()
