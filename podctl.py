@@ -28,7 +28,14 @@ from datetime import datetime, timedelta
 MAX_MESSAGE_SIZE = 2048
 PING_TIMEOUT = timedelta(seconds=1)
 
-logging.basicConfig(level=logging.WARN)
+PROMPT_TRACK = 0
+LAST_PROMPT = ""
+
+
+def progress():
+    global PROMPT_TRACK
+    PROMPT_TRACK = (PROMPT_TRACK + 1) % 5
+    return "." * PROMPT_TRACK + " " * (4-PROMPT_TRACK)
 
 
 class PodStateType(type):
@@ -49,11 +56,28 @@ class PodStateType(type):
         'SHUTDOWN': 13
     }
 
+    SHORT_MAP = {
+        'POST': 0,
+        'BOOT': 1,
+        'LPFL': 2,
+        'HPFL': 3,
+        'LOAD': 4,
+        'STBY': 5,
+        'ARMD': 6,
+        'PUSH': 7,
+        'COAS': 8,
+        'BRKE': 9,
+        'VENT': 10,
+        'RETR': 11,
+        'EMRG': 12,
+        'SDWN': 13
+    }
 
     def __getattr__(cls, name):
         if name in cls.MAP:
             return cls.MAP[name]
         raise AttributeError(name)
+
 
 class PodState(metaclass=PodStateType):
     def __init__(self, state):
@@ -63,7 +87,8 @@ class PodState(metaclass=PodStateType):
         return self._state == PodState.EMERGENCY
 
     def is_moving(self):
-        return self._state in (PodState.BRAKING, PodState.COASTING, PodState.PUSHING)
+        return self._state in (PodState.BRAKING, PodState.COASTING,
+                               PodState.PUSHING)
 
     def __str__(self):
         keys = [key for key, val in PodState.MAP.items() if val == self._state]
@@ -71,6 +96,15 @@ class PodState(metaclass=PodStateType):
             return "UNKNOWN"
         else:
             return keys[0]
+
+    def short(self):
+        keys = [key for key, val in PodState.SHORT_MAP.items()
+                if val == self._state]
+        if not keys:
+            return "----"
+        else:
+            return keys[0]
+
 
 class Pod:
     def __init__(self, addr):
@@ -92,7 +126,13 @@ class Pod:
         if "PONG" in data:
             self.last_ping = datetime.now()
             self.recieved += 1
-            self.state = PodState(data.split(":")[1])
+            state = PodState(data.split(":")[1])
+            if self.state is None or state._state != self.state._state:
+                sys.stdout.write("\r")
+
+                self.state = state
+                user_write(make_prompt(self))
+            self.state = state
         else:
             sys.stdout.write(data)
 
@@ -125,20 +165,17 @@ class Pod:
             self.close()
 
     def connect(self):
-        while True:
-            try:
-                self.sock = socket.create_connection(self.addr, 1)
+        try:
+            self.sock = socket.create_connection(self.addr, 1)
 
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
-                self.recieved = 0
-                self.last_ping = datetime.now()
-                break
-            except Exception as e:
-                logging.error(e)
-                time.sleep(1)
-                self.close()
+            self.recieved = 0
+            self.last_ping = datetime.now()
+        except Exception as e:
+            self.close()
+            raise e
 
     def close(self):
         if self.sock is not None:
@@ -169,25 +206,46 @@ def user_write(txt):
     sys.stdout.write(txt)
     sys.stdout.flush()
 
-def make_prompt(pod):
+
+def make_prompt(pod, extra="> "):
+    global LAST_PROMPT
+
     details = "%s:%d" % pod.addr
     if pod.state is not None:
-        details += " %s" % pod.state
+        details += " %s" % pod.state.short()
         if pod.state.is_fault():
             details = Ansi.make_red(details)
         else:
             details = Ansi.make_green(details)
     else:
-        details = Ansi.make_yellow(details)
+        walker = progress()
+        details = Ansi.make_yellow(details + " " + walker)
 
-    return Ansi.make_bold("Pod(%s)> " % details)
+    text = Ansi.make_bold("Pod(%s)%s" % (details, extra))
+    raw = Ansi.strip(text)
+
+    if len(Ansi.strip(LAST_PROMPT)) > len(raw):
+        text += " " * (len(LAST_PROMPT) - len(raw))
+
+    LAST_PROMPT = text.rstrip()
+    return text
+
 
 def loop(pod):
-    print("CLI Connecting to {}:{}".format(pod.addr[0], pod.addr[1]))
-    pod.connect()
+    user_write(make_prompt(pod))
 
-    if pod.is_connected():
-        pod.command("help")
+    while not pod.is_connected():
+        try:
+            logging.debug("Attempting Connection")
+            pod.connect()
+        except Exception as e:
+            logging.debug("Connection Exception: %s" % e)
+            user_write("\r")
+            user_write(make_prompt(pod, " ! %s " % e))
+        time.sleep(1)
+    logging.debug("Connected")
+
+    pod.command("help")
 
     while pod.is_connected():
         (ready, _, _) = select.select([pod.sock, sys.stdin], [], [], 0.1)
@@ -198,16 +256,19 @@ def loop(pod):
                 user_write(make_prompt(pod))
 
         if sys.stdin in ready:
-            cmd = sys.stdin.readline()
-            if cmd == '':
+            try:
+                cmd = input()
+            except EOFError:
+                logging.debug("EOF")
                 sys.exit(0)
             pod.command(cmd)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Openloop Command Client",
                                      add_help=False)
 
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true", default=False)
 
     parser.add_argument("-p", "--port", type=int, default=7779,
                         help="Pod server port")
@@ -222,6 +283,9 @@ def main():
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
+        logging.debug("Debug Logging Enabled")
+    else:
+        logging.basicConfig(level=logging.WARN)
 
     pod = Pod((args.host, args.port))
 
@@ -245,6 +309,7 @@ def main():
         except Exception as e:
             print("[ERROR] %s" % e)
             traceback.print_exc()
+
 
 if "__main__" == __name__:
     main()
