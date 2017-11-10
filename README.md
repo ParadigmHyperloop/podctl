@@ -1,5 +1,7 @@
 # PodCTL
 
+**PodCTL now lives in the ODS repo where the standard Python remote command library is also maintained**
+
 PodCTL is a command line utility for interacting directly with the 
 Core Controller's Remote Command Server.
 
